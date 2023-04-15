@@ -678,6 +678,7 @@ class SetLatentNoiseMask:
 
 
 def common_ksampler(model, seed, steps, cfg, sampler_name, scheduler, positive, negative, latent, denoise=1.0, disable_noise=False, start_step=None, last_step=None, force_full_denoise=False):
+    model_management.mutex.acquire()
     latent_image = latent["samples"]
     noise_mask = None
     device = model_management.get_torch_device()
@@ -741,6 +742,7 @@ def common_ksampler(model, seed, steps, cfg, sampler_name, scheduler, positive, 
 
     out = latent.copy()
     out["samples"] = samples
+    model_management.mutex.release()
     return (out, )
 
 class KSampler:

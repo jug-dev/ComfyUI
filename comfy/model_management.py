@@ -1,6 +1,7 @@
 import psutil
 from enum import Enum
 from cli_args import args
+import threading
 
 class VRAMState(Enum):
     CPU = 0
@@ -118,6 +119,7 @@ current_gpu_controlnets = []
 
 model_accelerated = False
 
+mutex = threading.RLock()
 
 def unload_model():
     global current_loaded_model
@@ -136,11 +138,11 @@ def unload_model():
         current_loaded_model.unpatch_model()
         current_loaded_model = None
 
-    if vram_state != VRAMState.HIGH_VRAM:
-        if len(current_gpu_controlnets) > 0:
-            for n in current_gpu_controlnets:
-                n.cpu()
-            current_gpu_controlnets = []
+    # if vram_state != VRAMState.HIGH_VRAM:
+    #     if len(current_gpu_controlnets) > 0:
+    #         for n in current_gpu_controlnets:
+    #             n.cpu()
+    #         current_gpu_controlnets = []
 
 
 def load_model_gpu(model):
@@ -150,7 +152,8 @@ def load_model_gpu(model):
 
     if model is current_loaded_model:
         return
-    unload_model()
+    if model:
+        unload_model()
     try:
         real_model = model.patch_model()
     except Exception as e:
@@ -307,8 +310,6 @@ def should_use_fp16():
 
     return True
 
-#TODO: might be cleaner to put this somewhere else
-import threading
 
 class InterruptProcessingException(Exception):
     pass

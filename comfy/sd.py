@@ -409,7 +409,6 @@ class VAE:
         return output
 
     def decode(self, samples_in):
-        model_management.unload_model()
         self.first_stage_model = self.first_stage_model.to(self.device)
         try:
             free_memory = model_management.get_free_memory(self.device)
@@ -429,14 +428,12 @@ class VAE:
         return pixel_samples
 
     def decode_tiled(self, samples, tile_x=64, tile_y=64, overlap = 16):
-        model_management.unload_model()
         self.first_stage_model = self.first_stage_model.to(self.device)
         output = self.decode_tiled_(samples, tile_x, tile_y, overlap)
         self.first_stage_model = self.first_stage_model.cpu()
         return output.movedim(1,-1)
 
     def encode(self, pixel_samples):
-        model_management.unload_model()
         self.first_stage_model = self.first_stage_model.to(self.device)
         pixel_samples = pixel_samples.movedim(-1,1).to(self.device)
         samples = self.first_stage_model.encode(2. * pixel_samples - 1.).sample() * self.scale_factor
@@ -445,7 +442,6 @@ class VAE:
         return samples
 
     def encode_tiled(self, pixel_samples, tile_x=512, tile_y=512, overlap = 64):
-        model_management.unload_model()
         self.first_stage_model = self.first_stage_model.to(self.device)
         pixel_samples = pixel_samples.movedim(-1,1).to(self.device)
         samples = utils.tiled_scale(pixel_samples, lambda a: self.first_stage_model.encode(2. * a - 1.).sample() * self.scale_factor, tile_x, tile_y, overlap, upscale_amount = (1/8), out_channels=4)
