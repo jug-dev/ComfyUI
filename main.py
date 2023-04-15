@@ -25,7 +25,7 @@ import yaml
 import execution
 import folder_paths
 import server
-from nodes import init_custom_nodes
+from nodes import init_custom_nodes, load_custom_nodes
 
 
 def prompt_worker(q, server):
@@ -82,6 +82,7 @@ if __name__ == "__main__":
     q = execution.PromptQueue(server)
 
     init_custom_nodes()
+    load_custom_nodes(os.getenv("AIWORKER_CUSTOM_NODES"))
     server.add_routes()
     hijack_progress(server)
 
