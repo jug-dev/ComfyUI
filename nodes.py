@@ -21,16 +21,21 @@ import comfy.utils
 
 import comfy.clip_vision
 
-import model_management
+import comfy.model_management
 import importlib
 
 import folder_paths
 
+import pickle
+import time
+from loguru import logger
+import threading
+
 def before_node_execution():
-    model_management.throw_exception_if_processing_interrupted()
+    comfy.model_management.throw_exception_if_processing_interrupted()
 
 def interrupt_processing(value=True):
-    model_management.interrupt_current_processing(value)
+    comfy.model_management.interrupt_current_processing(value)
 
 MAX_RESOLUTION=8192
 
@@ -241,7 +246,7 @@ class DiffusersLoader:
                     model_path = os.path.join(search_path, model_path)
                     break
 
-        return comfy.diffusers_convert.load_diffusers(model_path, fp16=model_management.should_use_fp16(), output_vae=output_vae, output_clip=output_clip, embedding_directory=folder_paths.get_folder_paths("embeddings"))
+        return comfy.diffusers_convert.load_diffusers(model_path, fp16=comfy.model_management.should_use_fp16(), output_vae=output_vae, output_clip=output_clip, embedding_directory=folder_paths.get_folder_paths("embeddings"))
 
 
 class unCLIPCheckpointLoader:
@@ -676,12 +681,10 @@ class SetLatentNoiseMask:
         s["noise_mask"] = mask
         return (s,)
 
-
 def common_ksampler(model, seed, steps, cfg, sampler_name, scheduler, positive, negative, latent, denoise=1.0, disable_noise=False, start_step=None, last_step=None, force_full_denoise=False):
-    model_management.mutex.acquire()
     latent_image = latent["samples"]
     noise_mask = None
-    device = model_management.get_torch_device()
+    device = comfy.model_management.get_torch_device()
 
     if disable_noise:
         noise = torch.zeros(latent_image.size(), dtype=latent_image.dtype, layout=latent_image.layout, device="cpu")
@@ -696,16 +699,19 @@ def common_ksampler(model, seed, steps, cfg, sampler_name, scheduler, positive, 
         noise_mask = torch.cat([noise_mask] * noise.shape[0])
         noise_mask = noise_mask.to(device)
 
-    real_model = None
-    model_management.load_model_gpu(model)
+    comfy.model_management.model_manager.set_model_in_use(model)
+    comfy.model_management.model_manager.load_model_gpu(model)
     real_model = model.model
 
+    #logger.warning(f"Moving noise {id(noise):x} to device {device}")
     noise = noise.to(device)
+    #logger.warning(f"Moving latest image {id(latent_image):x} to device {device}")
     latent_image = latent_image.to(device)
 
     positive_copy = []
     negative_copy = []
 
+    #logger.warning(f"Assembling control nets")
     control_nets = []
     for p in positive:
         t = p[0]
@@ -727,22 +733,35 @@ def common_ksampler(model, seed, steps, cfg, sampler_name, scheduler, positive, 
     control_net_models = []
     for x in control_nets:
         control_net_models += x.get_control_models()
-    model_management.load_controlnet_gpu(control_net_models)
+    if control_net_models:
+        #logger.warning(f"Model {id(model):x} has {len(control_net_models)} control nets")
+        comfy.model_management.model_manager.load_controlnet_gpu(control_net_models)
+        comfy.model_management.model_manager.sampler_mutex.acquire()
 
     if sampler_name in comfy.samplers.KSampler.SAMPLERS:
+        #logger.warning(f"Creating KSampler for real model {id(real_model):x}")
         sampler = comfy.samplers.KSampler(real_model, steps=steps, device=device, sampler=sampler_name, scheduler=scheduler, denoise=denoise, model_options=model.model_options)
     else:
         #other samplers
         pass
 
+    #logger.warning(f"Sampling")
     samples = sampler.sample(noise, positive_copy, negative_copy, cfg=cfg, latent_image=latent_image, start_step=start_step, last_step=last_step, force_full_denoise=force_full_denoise, denoise_mask=noise_mask)
+    #logger.warning("Done sampling")
     samples = samples.cpu()
+    #logger.warning("Moved samples to cpu")
+    if control_net_models:
+        # XXX force unload models for controlnet
+        #logger.warning("Forcing GPU unload of controlnet models")
+        comfy.model_management.model_manager.unload_controlnet_gpu(control_net_models)
+        comfy.model_management.model_manager.unload_model(model)
+        comfy.model_management.model_manager.sampler_mutex.release()
     for c in control_nets:
         c.cleanup()
 
     out = latent.copy()
     out["samples"] = samples
-    model_management.mutex.release()
+    comfy.model_management.model_manager.done_with_model(model)
     return (out, )
 
 class KSampler:
@@ -905,6 +924,7 @@ class LoadImage:
     def load_image(self, image):
         input_dir = folder_paths.get_input_directory()
         image_path = os.path.join(input_dir, image)
+        #logger.warning(f"Loading image {image_path}")
         i = Image.open(image_path)
         image = i.convert("RGB")
         image = np.array(image).astype(np.float32) / 255.0
@@ -1179,18 +1199,17 @@ def load_custom_node(module_path):
         print(traceback.format_exc())
         print(f"Cannot import {module_path} module for custom nodes:", e)
 
-def load_custom_nodes(path=os.path.join(os.path.dirname(os.path.realpath(__file__)), "custom_nodes")):
-    if not path:
-        return
-    CUSTOM_NODE_PATH = path
-    possible_modules = os.listdir(CUSTOM_NODE_PATH)
-    if "__pycache__" in possible_modules:
-        possible_modules.remove("__pycache__")
+def load_custom_nodes():
+    node_paths = folder_paths.get_folder_paths("custom_nodes")
+    for custom_node_path in node_paths:
+        possible_modules = os.listdir(custom_node_path)
+        if "__pycache__" in possible_modules:
+            possible_modules.remove("__pycache__")
 
-    for possible_module in possible_modules:
-        module_path = os.path.join(CUSTOM_NODE_PATH, possible_module)
-        if os.path.isfile(module_path) and os.path.splitext(module_path)[1] != ".py": continue
-        load_custom_node(module_path)
+        for possible_module in possible_modules:
+            module_path = os.path.join(custom_node_path, possible_module)
+            if os.path.isfile(module_path) and os.path.splitext(module_path)[1] != ".py": continue
+            load_custom_node(module_path)
 
 def init_custom_nodes():
     load_custom_nodes()

@@ -2,6 +2,7 @@ import psutil
 from enum import Enum
 from cli_args import args
 import threading
+from loguru import logger
 
 class VRAMState(Enum):
     CPU = 0
@@ -114,89 +115,161 @@ if args.cpu:
 print(f"Set vram state to: {vram_state.name}")
 
 
-current_loaded_model = None
-current_gpu_controlnets = []
+class ModelManager:
+    _instance = None
+    _initialised = False
+    _mutex = threading.RLock()
+    sampler_mutex = threading.RLock()
+    system_reserved_vram_mb = 6 * 1024
+    user_reserved_vram_mb = 0
 
-model_accelerated = False
+    # We are a singleton
+    def __new__(cls):
+        if cls._instance is None:
+            cls._instance = super().__new__(cls)
+        return cls._instance
 
-mutex = threading.RLock()
+    # We initialise only ever once (in the lifetime of the singleton)
+    def __init__(self):
+        if not self._initialised:
+            self.models_in_use = []
+            self.current_loaded_models = []
+            self.current_gpu_controlnets = []
+            self.models_accelerated = []
+            self.__class__._initialised = True    
 
-def unload_model():
-    global current_loaded_model
-    global model_accelerated
-    global current_gpu_controlnets
-    global vram_state
+    def set_user_reserved_vram(self, vram_mb):
+        with self._mutex:
+            self.user_reserved_vram_mb = vram_mb
 
-    if current_loaded_model is not None:
-        if model_accelerated:
-            accelerate.hooks.remove_hook_from_submodules(current_loaded_model.model)
-            model_accelerated = False
+    def get_models_on_gpu(self):
+        with self._mutex:
+            return self.current_loaded_models[:]
 
-        #never unload models from GPU on high vram
-        if vram_state != VRAMState.HIGH_VRAM:
-            current_loaded_model.model.cpu()
-        current_loaded_model.unpatch_model()
-        current_loaded_model = None
+    def set_model_in_use(self, model):
+        with self._mutex:
+            self.models_in_use.append(model)
 
-    # if vram_state != VRAMState.HIGH_VRAM:
-    #     if len(current_gpu_controlnets) > 0:
-    #         for n in current_gpu_controlnets:
-    #             n.cpu()
-    #         current_gpu_controlnets = []
+    def is_model_in_use(self, model):
+        with self._mutex:
+            return model in self.models_in_use
 
+    def unload_model(self, model):
+        global vram_state
+        with self._mutex:
+            if model not in self.current_loaded_models:
+                logger.debug("Skip GPU unload as not on the GPU")
+                return
 
-def load_model_gpu(model):
-    global current_loaded_model
-    global vram_state
-    global model_accelerated
+            if model in self.models_in_use:
+                logger.debug("Not unloaded model as it is in use right now")
+                return
 
-    if model is current_loaded_model:
-        return
-    if model:
-        unload_model()
-    try:
-        real_model = model.patch_model()
-    except Exception as e:
-        model.unpatch_model()
-        raise e
-    current_loaded_model = model
-    if vram_state == VRAMState.CPU:
-        pass
-    elif vram_state == VRAMState.MPS:
-        mps_device = torch.device("mps")
-        real_model.to(mps_device)
-        pass
-    elif vram_state == VRAMState.NORMAL_VRAM or vram_state == VRAMState.HIGH_VRAM:
-        model_accelerated = False
-        real_model.to(get_torch_device())
-    else:
-        if vram_state == VRAMState.NO_VRAM:
-            device_map = accelerate.infer_auto_device_map(real_model, max_memory={0: "256MiB", "cpu": "16GiB"})
-        elif vram_state == VRAMState.LOW_VRAM:
-            device_map = accelerate.infer_auto_device_map(real_model, max_memory={0: "{}MiB".format(total_vram_available_mb), "cpu": "16GiB"})
+            if model in self.models_accelerated:
+                accelerate.hooks.remove_hook_from_submodules(model.model)
+                self.models_accelerated.remove(model)
 
-        accelerate.dispatch_model(real_model, device_map=device_map, main_device=get_torch_device())
-        model_accelerated = True
-    return current_loaded_model
+            # Unload to RAM
+            model.model.cpu()
+            model.unpatch_model()
+            self.current_loaded_models.remove(model)
+            #logger.warning(f"Unload model {id(model):x}")
 
-def load_controlnet_gpu(models):
-    global current_gpu_controlnets
-    global vram_state
-    if vram_state == VRAMState.CPU:
-        return
+    def done_with_model(self, model):
+        with self._mutex:
+            if model in self.models_in_use:
+                self.models_in_use.remove(model)
 
-    if vram_state == VRAMState.LOW_VRAM or vram_state == VRAMState.NO_VRAM:
-        #don't load controlnets like this if low vram because they will be loaded right before running and unloaded right after
-        return
+    def load_model_gpu(self, model):
+        global vram_state
+        
+        with self._mutex:
+            #logger.warning(f"load_model_gpu( {id(model):x} )")
 
-    for m in current_gpu_controlnets:
-        if m not in models:
-            m.cpu()
+            # Don't run out of vram
+            if self.current_loaded_models:
+                freemem = round(get_free_memory(get_torch_device()) / (1024 * 1024))
+                logger.debug(f"Free VRAM is: {freemem}MB ({len(self.current_loaded_models)} models loaded on GPU)")
+                if freemem < (self.system_reserved_vram_mb + self.user_reserved_vram_mb):
+                    # release the least used model
+                    #logger.warning("Will unload least used model")
+                    self.unload_model(self.current_loaded_models[-1])
+                    freemem = round(get_free_memory(get_torch_device()) / (1024 * 1024))
+                    logger.debug(f"Unloaded a model, free VRAM is now: {freemem}MB ({len(self.current_loaded_models)} models loaded on GPU)")
 
-    device = get_torch_device()
-    current_gpu_controlnets = []
-    for m in models:
-        current_gpu_controlnets.append(m.to(device))
+            if model in self.current_loaded_models:
+                # Move this model to the top of the list
+                self.current_loaded_models.insert(0, self.current_loaded_models.pop(self.current_loaded_models.index(model)))
+                #logger.warning(f"Model {id(model):x} already on GPU so not loading")
+                return model
+            
+            try:
+                #logger.warning(f"Patching model {id(model):x}")
+                real_model = model.patch_model()
+            except Exception as e:
+                logger.error("Patching failed")
+                model.unpatch_model()
+                raise e
+            
+            #logger.warning(f"Adding model to current_loaded_models {id(model):x}")
+            self.current_loaded_models.insert(0, model)
+
+            if vram_state == VRAMState.CPU:
+                pass
+            elif vram_state == VRAMState.MPS:
+                mps_device = torch.device("mps")
+                real_model.to(mps_device)
+            elif vram_state == VRAMState.NORMAL_VRAM or vram_state == VRAMState.HIGH_VRAM:
+                if model in self.models_accelerated:
+                    #logger.warning(f"removing model from accelerated list {id(model):x}")
+                    self.models_accelerated.remove(model)
+                #logger.warning(f"Moving model {id(model):x} / {id(real_model):x} to device {get_torch_device()}")
+                real_model.to(get_torch_device())
+                #logger.warning(f"Done moving model {id(model):x} / {id(real_model):x} to device {get_torch_device()}")
+            else:
+                if vram_state == VRAMState.NO_VRAM:
+                    device_map = accelerate.infer_auto_device_map(real_model, max_memory={0: "256MiB", "cpu": "16GiB"})
+                elif vram_state == VRAMState.LOW_VRAM:
+                    device_map = accelerate.infer_auto_device_map(real_model, max_memory={0: "{}MiB".format(total_vram_available_mb), "cpu": "16GiB"})
+
+                accelerate.dispatch_model(real_model, device_map=device_map, main_device=get_torch_device())
+                self.models_accelerated.append(model)
+            return model
+
+    def load_controlnet_gpu(self, models):        
+        with self._mutex:
+            global vram_state
+            if vram_state == VRAMState.CPU:
+                return
+
+            if vram_state == VRAMState.LOW_VRAM or vram_state == VRAMState.NO_VRAM:
+                #don't load controlnets like this if low vram because they will be loaded right before running and unloaded right after
+                return
+
+            device = get_torch_device()
+            for m in models:
+                if m not in self.current_gpu_controlnets:
+                    #logger.warning(f"Loaded controlnet {id(m):x} to GPU")
+                    self.current_gpu_controlnets.append(m.to(device))
+
+    def unload_controlnet_gpu(self, models):        
+        with self._mutex:
+            global vram_state
+            if vram_state == VRAMState.CPU:
+                return
+
+            if vram_state == VRAMState.LOW_VRAM or vram_state == VRAMState.NO_VRAM:
+                #don't load controlnets like this if low vram because they will be loaded right before running and unloaded right after
+                return
+
+            for m in models:
+                if m in self.current_gpu_controlnets:
+                    m.cpu()
+                    self.current_gpu_controlnets.remove(m)
+                    #logger.warning(f"Unloaded controlnet {id(m):x} from GPU")
+                    del m
+
+model_manager = ModelManager()
 
 
 def load_if_low_vram(model):
@@ -310,6 +383,17 @@ def should_use_fp16():
 
     return True
 
+def soft_empty_cache():
+    global xpu_available
+    if xpu_available:
+        torch.xpu.empty_cache()
+    elif torch.cuda.is_available():
+        if torch.version.cuda: #This seems to make things worse on ROCm so I only do it for cuda
+            torch.cuda.empty_cache()
+            torch.cuda.ipc_collect()
+
+#TODO: might be cleaner to put this somewhere else
+import threading
 
 class InterruptProcessingException(Exception):
     pass

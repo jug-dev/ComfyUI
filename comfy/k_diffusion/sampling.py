@@ -8,6 +8,8 @@ import torchsde
 from tqdm.auto import trange, tqdm
 
 from . import utils
+from loguru import logger
+import threading
 
 
 def append_zero(x):
@@ -584,24 +586,36 @@ def sample_dpmpp_sde(model, x, sigmas, extra_args=None, callback=None, disable=N
 @torch.no_grad()
 def sample_dpmpp_2m(model, x, sigmas, extra_args=None, callback=None, disable=None):
     """DPM-Solver++(2M)."""
+    # logger.warning(f"Starting DPM-Solver++(2M) on model {id(model):x}")
     extra_args = {} if extra_args is None else extra_args
     s_in = x.new_ones([x.shape[0]])
     sigma_fn = lambda t: t.neg().exp()
     t_fn = lambda sigma: sigma.log().neg()
     old_denoised = None
 
+    # logger.warning(f"Starting iterations of DPM-Solver++(2M) on model {id(model):x}")
     for i in trange(len(sigmas) - 1, disable=disable):
+        # logger.warning(f"Starting iterations {i} on model {id(model):x}")
+        # logger.warning(f"denoise = {id(model):x}({id(x):x}, {id(sigmas):x} * {id(s_in)}, {id(extra_args)})")
         denoised = model(x, sigmas[i] * s_in, **extra_args)
+        # logger.warning(f"  denoised on model {id(model):x}")
         if callback is not None:
             callback({'x': x, 'i': i, 'sigma': sigmas[i], 'sigma_hat': sigmas[i], 'denoised': denoised})
+        # logger.warning(f"  step 1 {id(model):x}")
         t, t_next = t_fn(sigmas[i]), t_fn(sigmas[i + 1])
+        # logger.warning(f"  step 2 {id(model):x}")
         h = t_next - t
+        # logger.warning(f"  step 3 {id(model):x}")
         if old_denoised is None or sigmas[i + 1] == 0:
+            # logger.warning(f"  step 3a {id(model):x}")
             x = (sigma_fn(t_next) / sigma_fn(t)) * x - (-h).expm1() * denoised
         else:
+            # logger.warning(f"  step 3b {id(model):x}")
             h_last = t - t_fn(sigmas[i - 1])
             r = h_last / h
             denoised_d = (1 + 1 / (2 * r)) * denoised - (1 / (2 * r)) * old_denoised
             x = (sigma_fn(t_next) / sigma_fn(t)) * x - (-h).expm1() * denoised_d
+        # logger.warning(f"  step 4 end iteration {id(model):x}")
         old_denoised = denoised
+    # logger.warning(f"Done DPM-Solver++(2M) on model {id(model):x}")
     return x

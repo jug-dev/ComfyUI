@@ -1,10 +1,11 @@
 import torch
 import contextlib
 import copy
+import threading
 
 import sd1_clip
 import sd2_clip
-import model_management
+from comfy import model_management
 from .ldm.util import instantiate_from_config
 from .ldm.models.autoencoder import AutoencoderKL
 import yaml
@@ -13,6 +14,8 @@ from .t2i_adapter import adapter
 
 from . import utils
 from . import clip_vision
+from loguru import logger
+import threading
 
 def load_model_weights(model, sd, verbose=False, load_state_dict_to=[]):
     m, u = model.load_state_dict(sd, strict=False)
@@ -265,6 +268,7 @@ class ModelPatcher:
     def patch_model(self):
         model_sd = self.model.state_dict()
         for p in self.patches:
+            #logger.warning(f"Patching model {id(self):x} {len(self.patches)} patches")
             for k in p[1]:
                 v = p[1][k]
                 key = k
@@ -372,10 +376,12 @@ class CLIP:
     def clip_layer(self, layer_idx):
         self.layer_idx = layer_idx
 
-    def encode(self, text):
+    def tokenize(self, text, return_word_ids=False):
+        return self.tokenizer.tokenize_with_weights(text, return_word_ids)
+
+    def encode_from_tokens(self, tokens):
         if self.layer_idx is not None:
             self.cond_stage_model.clip_layer(self.layer_idx)
-        tokens = self.tokenizer.tokenize_with_weights(text)
         try:
             self.patcher.patch_model()
             cond = self.cond_stage_model.encode_token_weights(tokens)
@@ -384,6 +390,10 @@ class CLIP:
             self.patcher.unpatch_model()
             raise e
         return cond
+
+    def encode(self, text):
+        tokens = self.tokenize(text)
+        return self.encode_from_tokens(tokens)
 
 class VAE:
     def __init__(self, ckpt_path=None, scale_factor=0.18215, device=None, config=None):
@@ -409,48 +419,72 @@ class VAE:
         return output
 
     def decode(self, samples_in):
-        self.first_stage_model = self.first_stage_model.to(self.device)
-        try:
-            free_memory = model_management.get_free_memory(self.device)
-            batch_number = int((free_memory * 0.7) / (2562 * samples_in.shape[2] * samples_in.shape[3] * 64))
-            batch_number = max(1, batch_number)
+        with model_management.model_manager.sampler_mutex:
+            tid = threading.current_thread().ident
+            #logger.warning(f"VAE.decode({tid}) would unload model")
+            # model_management.unload_model()
 
-            pixel_samples = torch.empty((samples_in.shape[0], 3, round(samples_in.shape[2] * 8), round(samples_in.shape[3] * 8)), device="cpu")
-            for x in range(0, samples_in.shape[0], batch_number):
-                samples = samples_in[x:x+batch_number].to(self.device)
-                pixel_samples[x:x+batch_number] = torch.clamp((self.first_stage_model.decode(1. / self.scale_factor * samples) + 1.0) / 2.0, min=0.0, max=1.0).cpu()
-        except model_management.OOM_EXCEPTION as e:
-            print("Warning: Ran out of memory when regular VAE decoding, retrying with tiled VAE decoding.")
-            pixel_samples = self.decode_tiled_(samples_in)
+            #logger.warning(f"VAE.decode({tid}) first_stage_model to device {self.device}")
+            self.first_stage_model = self.first_stage_model.to(self.device)
+            try:
+                #logger.warning(f"VAE.decode({tid}) get free memory")
+                free_memory = model_management.get_free_memory(self.device)
+                batch_number = int((free_memory * 0.7) / (2562 * samples_in.shape[2] * samples_in.shape[3] * 64))
+                batch_number = max(1, batch_number)
+                #logger.warning(f"VAE.decode({tid}) {batch_number} batches")
 
-        self.first_stage_model = self.first_stage_model.cpu()
-        pixel_samples = pixel_samples.cpu().movedim(1,-1)
-        return pixel_samples
+                #logger.warning(f"VAE.decode({tid}) torch.empty")
+                pixel_samples = torch.empty((samples_in.shape[0], 3, round(samples_in.shape[2] * 8), round(samples_in.shape[3] * 8)), device="cpu")
+                #logger.warning(f"VAE.decode({tid}) starting iterations")
+                for x in range(0, samples_in.shape[0], batch_number):
+                    samples = samples_in[x:x+batch_number].to(self.device)
+                    #logger.warning(f"VAE.decode({tid}) got samples")
+                    pixel_samples[x:x+batch_number] = torch.clamp((self.first_stage_model.decode(1. / self.scale_factor * samples) + 1.0) / 2.0, min=0.0, max=1.0).cpu()
+                    #logger.warning(f"VAE.decode({tid}) clamped")
+            except model_management.OOM_EXCEPTION as e:
+                print("Warning: Ran out of memory when regular VAE decoding, retrying with tiled VAE decoding.")
+                pixel_samples = self.decode_tiled_(samples_in)
+
+            #logger.warning(f"VAE.decode({tid}) moving to cpu")
+            self.first_stage_model = self.first_stage_model.cpu()
+            #logger.warning(f"VAE.decode({tid}) calculating pixels")
+            pixel_samples = pixel_samples.cpu().movedim(1,-1)
+            #logger.warning(f"VAE.decode({tid}) returning")
+            return pixel_samples
 
     def decode_tiled(self, samples, tile_x=64, tile_y=64, overlap = 16):
-        self.first_stage_model = self.first_stage_model.to(self.device)
-        output = self.decode_tiled_(samples, tile_x, tile_y, overlap)
-        self.first_stage_model = self.first_stage_model.cpu()
-        return output.movedim(1,-1)
+        with model_management.model_manager.sampler_mutex:
+            #logger.warning("VAE.decode_tiled() would unload model")
+            # model_management.unload_model()
+            self.first_stage_model = self.first_stage_model.to(self.device)
+            output = self.decode_tiled_(samples, tile_x, tile_y, overlap)
+            self.first_stage_model = self.first_stage_model.cpu()
+            return output.movedim(1,-1)
 
     def encode(self, pixel_samples):
-        self.first_stage_model = self.first_stage_model.to(self.device)
-        pixel_samples = pixel_samples.movedim(-1,1).to(self.device)
-        samples = self.first_stage_model.encode(2. * pixel_samples - 1.).sample() * self.scale_factor
-        self.first_stage_model = self.first_stage_model.cpu()
-        samples = samples.cpu()
-        return samples
+        #logger.warning("VAE.encode() would unload model")
+        # model_management.unload_model()
+        with model_management.model_manager.sampler_mutex:
+            self.first_stage_model = self.first_stage_model.to(self.device)
+            pixel_samples = pixel_samples.movedim(-1,1).to(self.device)
+            samples = self.first_stage_model.encode(2. * pixel_samples - 1.).sample() * self.scale_factor
+            self.first_stage_model = self.first_stage_model.cpu()
+            samples = samples.cpu()
+            return samples
 
     def encode_tiled(self, pixel_samples, tile_x=512, tile_y=512, overlap = 64):
-        self.first_stage_model = self.first_stage_model.to(self.device)
-        pixel_samples = pixel_samples.movedim(-1,1).to(self.device)
-        samples = utils.tiled_scale(pixel_samples, lambda a: self.first_stage_model.encode(2. * a - 1.).sample() * self.scale_factor, tile_x, tile_y, overlap, upscale_amount = (1/8), out_channels=4)
-        samples += utils.tiled_scale(pixel_samples, lambda a: self.first_stage_model.encode(2. * a - 1.).sample() * self.scale_factor, tile_x * 2, tile_y // 2, overlap, upscale_amount = (1/8), out_channels=4)
-        samples += utils.tiled_scale(pixel_samples, lambda a: self.first_stage_model.encode(2. * a - 1.).sample() * self.scale_factor, tile_x // 2, tile_y * 2, overlap, upscale_amount = (1/8), out_channels=4)
-        samples /= 3.0
-        self.first_stage_model = self.first_stage_model.cpu()
-        samples = samples.cpu()
-        return samples
+        #logger.warning("VAE.decode() would unload model")
+        # model_management.unload_model()
+        with model_management.model_manager.sampler_mutex:
+            self.first_stage_model = self.first_stage_model.to(self.device)
+            pixel_samples = pixel_samples.movedim(-1,1).to(self.device)
+            samples = utils.tiled_scale(pixel_samples, lambda a: self.first_stage_model.encode(2. * a - 1.).sample() * self.scale_factor, tile_x, tile_y, overlap, upscale_amount = (1/8), out_channels=4)
+            samples += utils.tiled_scale(pixel_samples, lambda a: self.first_stage_model.encode(2. * a - 1.).sample() * self.scale_factor, tile_x * 2, tile_y // 2, overlap, upscale_amount = (1/8), out_channels=4)
+            samples += utils.tiled_scale(pixel_samples, lambda a: self.first_stage_model.encode(2. * a - 1.).sample() * self.scale_factor, tile_x // 2, tile_y * 2, overlap, upscale_amount = (1/8), out_channels=4)
+            samples /= 3.0
+            self.first_stage_model = self.first_stage_model.cpu()
+            samples = samples.cpu()
+            return samples
 
 def resize_image_to(tensor, target_latent_tensor, batched_number):
     tensor = utils.common_upscale(tensor, target_latent_tensor.shape[3] * 8, target_latent_tensor.shape[2] * 8, 'nearest-exact', "center")
@@ -558,8 +592,15 @@ class ControlNet:
         out.append(self.control_model)
         return out
 
+_controlnet_models = {}
+
 def load_controlnet(ckpt_path, model=None):
-    controlnet_data = utils.load_torch_file(ckpt_path)
+    if ckpt_path in _controlnet_models:
+        controlnet_data = copy.deepcopy(_controlnet_models.get(ckpt_path))
+    else:
+        controlnet_data = utils.load_torch_file(ckpt_path)
+        _controlnet_models[ckpt_path] = copy.deepcopy(controlnet_data)
+
     pth_key = 'control_model.input_blocks.1.1.transformer_blocks.0.attn2.to_k.weight'
     pth = False
     sd2 = False
@@ -619,6 +660,7 @@ def load_controlnet(ckpt_path, model=None):
             if model is not None:
                 m = model.patch_model()
                 model_sd = m.state_dict()
+                #logger.warning(f"Modifying model {id(model):x} with controlnet {id(controlnet_data):x}")
                 for x in controlnet_data:
                     c_m = "control_model."
                     if x.startswith(c_m):

@@ -3,9 +3,11 @@ from .k_diffusion import external as k_diffusion_external
 from .extra_samplers import uni_pc
 import torch
 import contextlib
-import model_management
+from comfy import model_management
 from .ldm.models.diffusion.ddim import DDIMSampler
 from .ldm.modules.diffusionmodules.util import make_ddim_timesteps
+from loguru import logger
+import threading
 
 class CFGDenoiser(torch.nn.Module):
     def __init__(self, model):
@@ -120,6 +122,7 @@ def sampling_function(model_function, x, timestep, uncond, cond, cond_scale, con
             return out
 
         def calc_cond_uncond_batch(model_function, cond, uncond, x_in, timestep, max_total_area, cond_concat_in, model_options):
+            # #logger.warning("calc_cond_uncond_batch()")
             out_cond = torch.zeros_like(x_in)
             out_count = torch.ones_like(x_in)/100000.0
 
@@ -130,12 +133,14 @@ def sampling_function(model_function, x, timestep, uncond, cond, cond_scale, con
             UNCOND = 1
 
             to_run = []
+            # #logger.warning("calc_cond_uncond_batch() 1")
             for x in cond:
                 p = get_area_and_mult(x, x_in, cond_concat_in, timestep)
                 if p is None:
                     continue
 
                 to_run += [(p, COND)]
+            #logger.warning("calc_cond_uncond_batch() 2")
             for x in uncond:
                 p = get_area_and_mult(x, x_in, cond_concat_in, timestep)
                 if p is None:
@@ -143,6 +148,7 @@ def sampling_function(model_function, x, timestep, uncond, cond, cond_scale, con
 
                 to_run += [(p, UNCOND)]
 
+            #logger.warning("calc_cond_uncond_batch() 3")
             while len(to_run) > 0:
                 first = to_run[0]
                 first_shape = first[0][0].shape
@@ -151,15 +157,18 @@ def sampling_function(model_function, x, timestep, uncond, cond, cond_scale, con
                     if can_concat_cond(to_run[x][0], first[0]):
                         to_batch_temp += [x]
 
+                #logger.warning("calc_cond_uncond_batch() 3a")
                 to_batch_temp.reverse()
                 to_batch = to_batch_temp[:1]
 
+                #logger.warning("calc_cond_uncond_batch() 3b")
                 for i in range(1, len(to_batch_temp) + 1):
                     batch_amount = to_batch_temp[:len(to_batch_temp)//i]
                     if (len(batch_amount) * first_shape[0] * first_shape[2] * first_shape[3] < max_total_area):
                         to_batch = batch_amount
                         break
 
+                #logger.warning("calc_cond_uncond_batch() 3c")
                 input_x = []
                 mult = []
                 c = []
@@ -186,12 +195,19 @@ def sampling_function(model_function, x, timestep, uncond, cond, cond_scale, con
 
                 if 'transformer_options' in model_options:
                     c['transformer_options'] = model_options['transformer_options']
+                #logger.warning(f"{threading.current_thread().ident}: calc_cond_uncond_batch() 3d")
+                #logger.warning(f"{threading.current_thread().ident}: {id(model_function):x}({id(input_x):x}, {id(timestep_):x}, {id(c):x})")
 
+                model_management.model_manager.sampler_mutex.acquire()
                 output = model_function(input_x, timestep_, cond=c).chunk(batch_chunks)
+                #logger.warning(f"{threading.current_thread().ident}: calc_cond_uncond_batch() 3d del")
                 del input_x
+                model_management.model_manager.sampler_mutex.release()
 
-                model_management.throw_exception_if_processing_interrupted()
-
+                #logger.warning(f"{threading.current_thread().ident}: calc_cond_uncond_batch() 3d(comfy)")
+                # model_management.throw_exception_if_processing_interrupted()
+                
+                #logger.warning("calc_cond_uncond_batch() 3f")
                 for o in range(batch_chunks):
                     if cond_or_uncond[o] == COND:
                         out_cond[:,:,area[o][2]:area[o][0] + area[o][2],area[o][3]:area[o][1] + area[o][3]] += output[o] * mult[o]
@@ -199,18 +215,26 @@ def sampling_function(model_function, x, timestep, uncond, cond, cond_scale, con
                     else:
                         out_uncond[:,:,area[o][2]:area[o][0] + area[o][2],area[o][3]:area[o][1] + area[o][3]] += output[o] * mult[o]
                         out_uncond_count[:,:,area[o][2]:area[o][0] + area[o][2],area[o][3]:area[o][1] + area[o][3]] += mult[o]
+                #logger.warning("calc_cond_uncond_batch() 3g")
                 del mult
+                #logger.warning("calc_cond_uncond_batch() 3h")
 
+
+            #logger.warning("calc_cond_uncond_batch() 4")
             out_cond /= out_count
             del out_count
+            #logger.warning("calc_cond_uncond_batch() 5")
             out_uncond /= out_uncond_count
             del out_uncond_count
+            #logger.warning("calc_cond_uncond_batch() 6")
 
             return out_cond, out_uncond
 
-
+        #logger.warning("Entering main shared sampling function")
         max_total_area = model_management.maximum_batch_area()
+        #logger.warning("Entering main shared sampling function 2")
         cond, uncond = calc_cond_uncond_batch(model_function, cond, uncond, x, timestep, max_total_area, cond_concat, model_options)
+        #logger.warning("Exiting main shared sampling function")
         return uncond + (cond - uncond) * cond_scale
 
 
@@ -440,12 +464,14 @@ class KSampler:
         sigmas = self.sigmas
         sigma_min = self.sigma_min
 
+        #logger.warning("sampler step 1")
         if last_step is not None and last_step < (len(sigmas) - 1):
             sigma_min = sigmas[last_step]
             sigmas = sigmas[:last_step + 1]
             if force_full_denoise:
                 sigmas[-1] = 0
 
+        #logger.warning("sampler step 2")
         if start_step is not None:
             if start_step < (len(sigmas) - 1):
                 sigmas = sigmas[start_step:]
@@ -455,6 +481,7 @@ class KSampler:
                 else:
                     return torch.zeros_like(noise)
 
+        #logger.warning("sampler step 3")
         positive = positive[:]
         negative = negative[:]
         #make sure each cond area has an opposite one with the same area
@@ -463,13 +490,16 @@ class KSampler:
         for c in negative:
             create_cond_with_same_area_if_none(positive, c)
 
+        #logger.warning("sampler step 4")
         apply_control_net_to_equal_area(positive, negative)
 
+        #logger.warning("sampler step 5")
         if self.model.model.diffusion_model.dtype == torch.float16:
             precision_scope = torch.autocast
         else:
             precision_scope = contextlib.nullcontext
 
+        #logger.warning("sampler step 6")
         if hasattr(self.model, 'noise_augmentor'): #unclip
             positive = encode_adm(self.model.noise_augmentor, positive, noise.shape[0], self.device)
             negative = encode_adm(self.model.noise_augmentor, negative, noise.shape[0], self.device)
@@ -497,7 +527,9 @@ class KSampler:
         else:
             max_denoise = True
 
+        #logger.warning("sampler step 7")
         with precision_scope(model_management.get_autocast_device(self.device)):
+            #logger.warning("sampler step 7a")
             if self.sampler == "uni_pc":
                 samples = uni_pc.sample_unipc(self.model_wrap, noise, latent_image, sigmas, sampling_function=sampling_function, max_denoise=max_denoise, extra_args=extra_args, noise_mask=denoise_mask)
             elif self.sampler == "uni_pc_bh2":
@@ -513,22 +545,23 @@ class KSampler:
                 sampler.make_schedule_timesteps(ddim_timesteps=timesteps, verbose=False)
                 z_enc = sampler.stochastic_encode(latent_image, torch.tensor([len(timesteps) - 1] * noise.shape[0]).to(self.device), noise=noise, max_denoise=max_denoise)
                 samples, _ = sampler.sample_custom(ddim_timesteps=timesteps,
-                                                     conditioning=positive,
-                                                     batch_size=noise.shape[0],
-                                                     shape=noise.shape[1:],
-                                                     verbose=False,
-                                                     unconditional_guidance_scale=cfg,
-                                                     unconditional_conditioning=negative,
-                                                     eta=0.0,
-                                                     x_T=z_enc,
-                                                     x0=latent_image,
-                                                     denoise_function=sampling_function,
-                                                     extra_args=extra_args,
-                                                     mask=noise_mask,
-                                                     to_zero=sigmas[-1]==0,
-                                                     end_step=sigmas.shape[0] - 1)
+                                                    conditioning=positive,
+                                                    batch_size=noise.shape[0],
+                                                    shape=noise.shape[1:],
+                                                    verbose=False,
+                                                    unconditional_guidance_scale=cfg,
+                                                    unconditional_conditioning=negative,
+                                                    eta=0.0,
+                                                    x_T=z_enc,
+                                                    x0=latent_image,
+                                                    denoise_function=sampling_function,
+                                                    extra_args=extra_args,
+                                                    mask=noise_mask,
+                                                    to_zero=sigmas[-1]==0,
+                                                    end_step=sigmas.shape[0] - 1)
 
             else:
+                #logger.warning("sampler step 7b")
                 extra_args["denoise_mask"] = denoise_mask
                 self.model_k.latent_image = latent_image
                 self.model_k.noise = noise
@@ -538,10 +571,13 @@ class KSampler:
                 if latent_image is not None:
                     noise += latent_image
                 if self.sampler == "dpm_fast":
+                    #logger.warning("sampler sample_dpm_fast")
                     samples = k_diffusion_sampling.sample_dpm_fast(self.model_k, noise, sigma_min, sigmas[0], self.steps, extra_args=extra_args)
                 elif self.sampler == "dpm_adaptive":
+                    #logger.warning("sampler sample_dpm_adaptive")
                     samples = k_diffusion_sampling.sample_dpm_adaptive(self.model_k, noise, sigma_min, sigmas[0], extra_args=extra_args)
                 else:
+                    #logger.warning("sampler: "+"sample_{}".format(self.sampler))
                     samples = getattr(k_diffusion_sampling, "sample_{}".format(self.sampler))(self.model_k, noise, sigmas, extra_args=extra_args)
 
         return samples.to(torch.float32)
