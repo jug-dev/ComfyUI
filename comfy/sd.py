@@ -16,6 +16,7 @@ from . import utils
 from . import clip_vision
 from loguru import logger
 import threading
+from . import gligen
 
 def load_model_weights(model, sd, verbose=False, load_state_dict_to=[]):
     m, u = model.load_state_dict(sd, strict=False)
@@ -253,6 +254,9 @@ class ModelPatcher:
     def set_model_tomesd(self, ratio):
         self.model_options["transformer_options"]["tomesd"] = {"ratio": ratio}
 
+    def set_model_sampler_cfg_function(self, sampler_cfg_function):
+        self.model_options["sampler_cfg_function"] = sampler_cfg_function
+
     def model_dtype(self):
         return self.model.diffusion_model.dtype
 
@@ -379,7 +383,7 @@ class CLIP:
     def tokenize(self, text, return_word_ids=False):
         return self.tokenizer.tokenize_with_weights(text, return_word_ids)
 
-    def encode_from_tokens(self, tokens):
+    def encode_from_tokens(self, tokens, return_pooled=False):
         if self.layer_idx is not None:
             self.cond_stage_model.clip_layer(self.layer_idx)
         try:
@@ -389,6 +393,10 @@ class CLIP:
         except Exception as e:
             self.patcher.unpatch_model()
             raise e
+        if return_pooled:
+            eos_token_index = max(range(len(tokens[0])), key=tokens[0].__getitem__)
+            pooled = cond[:, eos_token_index]
+            return cond, pooled
         return cond
 
     def encode(self, text):
@@ -585,10 +593,10 @@ class ControlNet:
         c.strength = self.strength
         return c
 
-    def get_control_models(self):
+    def get_models(self):
         out = []
         if self.previous_controlnet is not None:
-            out += self.previous_controlnet.get_control_models()
+            out += self.previous_controlnet.get_models()
         out.append(self.control_model)
         return out
 
@@ -766,10 +774,10 @@ class T2IAdapter:
             del self.cond_hint
             self.cond_hint = None
 
-    def get_control_models(self):
+    def get_models(self):
         out = []
         if self.previous_controlnet is not None:
-            out += self.previous_controlnet.get_control_models()
+            out += self.previous_controlnet.get_models()
         return out
 
 def load_t2i_adapter(t2i_data):
@@ -815,6 +823,13 @@ def load_clip(ckpt_path, embedding_directory=None):
     clip = CLIP(config=config, embedding_directory=embedding_directory)
     clip.load_from_state_dict(clip_data)
     return clip
+
+def load_gligen(ckpt_path):
+    data = utils.load_torch_file(ckpt_path)
+    model = gligen.load_gligen(data)
+    if model_management.should_use_fp16():
+        model = model.half()
+    return model
 
 def load_checkpoint(config_path, ckpt_path, output_vae=True, output_clip=True, embedding_directory=None):
     with open(config_path, 'r') as stream:
