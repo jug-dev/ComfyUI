@@ -3,6 +3,7 @@ from enum import Enum
 from cli_args import args
 import threading
 from loguru import logger
+from contextlib import nullcontext
 
 class VRAMState(Enum):
     CPU = 0
@@ -61,10 +62,10 @@ else:
             print("xformers version:", XFORMERS_VERSION)
             if XFORMERS_VERSION.startswith("0.0.18"):
                 print()
-                print("WARNING: This version of xformers has a major bug where you will get black images when generating high resolution images.")
-                print("Please downgrade or upgrade xformers to a different version.")
-                print()
-                XFORMERS_ENABLED_VAE = False
+                # print("WARNING: This version of xformers has a major bug where you will get black images when generating high resolution images.")
+                # print("Please downgrade or upgrade xformers to a different version.")
+                # print()
+                # XFORMERS_ENABLED_VAE = False
         except:
             pass
     except:
@@ -112,15 +113,19 @@ except:
 if args.cpu:
     vram_state = VRAMState.CPU
 
-print(f"Set vram state to: {vram_state.name}")
+# print(f"Set vram state to: {vram_state.name}")
 
 
 class ModelManager:
     _instance = None
     _initialised = False
-    _mutex = threading.RLock()
+    _load_mutex = threading.RLock()
+    _property_mutex = threading.RLock()
     sampler_mutex = threading.RLock()
-    system_reserved_vram_mb = 6 * 1024
+    vae_mutex = threading.RLock()
+
+    _property_mutex = nullcontext()
+
     user_reserved_vram_mb = 0
 
     # We are a singleton
@@ -139,24 +144,24 @@ class ModelManager:
             self.__class__._initialised = True    
 
     def set_user_reserved_vram(self, vram_mb):
-        with self._mutex:
+        with self._property_mutex:
             self.user_reserved_vram_mb = vram_mb
 
     def get_models_on_gpu(self):
-        with self._mutex:
+        with self._property_mutex:
             return self.current_loaded_models[:]
 
     def set_model_in_use(self, model):
-        with self._mutex:
+        with self._property_mutex:
             self.models_in_use.append(model)
 
     def is_model_in_use(self, model):
-        with self._mutex:
+        with self._property_mutex:
             return model in self.models_in_use
 
     def unload_model(self, model):
         global vram_state
-        with self._mutex:
+        with self._property_mutex:
             if model not in self.current_loaded_models:
                 logger.debug("Skip GPU unload as not on the GPU")
                 return
@@ -169,31 +174,33 @@ class ModelManager:
                 accelerate.hooks.remove_hook_from_submodules(model.model)
                 self.models_accelerated.remove(model)
 
-            # Unload to RAM
-            model.model.cpu()
-            model.unpatch_model()
             self.current_loaded_models.remove(model)
-            #logger.warning(f"Unload model {id(model):x}")
+
+        # Unload to RAM
+        model.model.cpu()
+        model.unpatch_model()
+        return True
 
     def done_with_model(self, model):
-        with self._mutex:
+        with self._property_mutex:
             if model in self.models_in_use:
                 self.models_in_use.remove(model)
 
     def load_model_gpu(self, model):
         global vram_state
         
-        with self._mutex:
+        with self._load_mutex:
             #logger.warning(f"load_model_gpu( {id(model):x} )")
 
             # Don't run out of vram
             if self.current_loaded_models:
                 freemem = round(get_free_memory(get_torch_device()) / (1024 * 1024))
                 logger.debug(f"Free VRAM is: {freemem}MB ({len(self.current_loaded_models)} models loaded on GPU)")
-                if freemem < (self.system_reserved_vram_mb + self.user_reserved_vram_mb):
-                    # release the least used model
-                    #logger.warning("Will unload least used model")
-                    self.unload_model(self.current_loaded_models[-1])
+                if freemem < self.user_reserved_vram_mb:
+                    # Release the first least used model that we can
+                    for release_model in reversed(self.current_loaded_models):
+                        if self.unload_model(release_model):
+                            break
                     freemem = round(get_free_memory(get_torch_device()) / (1024 * 1024))
                     logger.debug(f"Unloaded a model, free VRAM is now: {freemem}MB ({len(self.current_loaded_models)} models loaded on GPU)")
 
@@ -236,8 +243,8 @@ class ModelManager:
                 self.models_accelerated.append(model)
             return model
 
-    def load_controlnet_gpu(self, models):        
-        with self._mutex:
+    def load_controlnet_gpu(self, control_models):
+        with self._load_mutex:
             global vram_state
             if vram_state == VRAMState.CPU:
                 return
@@ -245,6 +252,10 @@ class ModelManager:
             if vram_state == VRAMState.LOW_VRAM or vram_state == VRAMState.NO_VRAM:
                 #don't load controlnets like this if low vram because they will be loaded right before running and unloaded right after
                 return
+
+            models = []
+            for m in control_models:
+                models += m.get_models()
 
             device = get_torch_device()
             for m in models:
@@ -252,8 +263,8 @@ class ModelManager:
                     #logger.warning(f"Loaded controlnet {id(m):x} to GPU")
                     self.current_gpu_controlnets.append(m.to(device))
 
-    def unload_controlnet_gpu(self, models):        
-        with self._mutex:
+    def unload_controlnet_gpu(self, control_models):
+        with self._load_mutex:
             global vram_state
             if vram_state == VRAMState.CPU:
                 return
@@ -262,11 +273,14 @@ class ModelManager:
                 #don't load controlnets like this if low vram because they will be loaded right before running and unloaded right after
                 return
 
+            models = []
+            for m in control_models:
+                models += m.get_models()
+
             for m in models:
                 if m in self.current_gpu_controlnets:
                     m.cpu()
                     self.current_gpu_controlnets.remove(m)
-                    #logger.warning(f"Unloaded controlnet {id(m):x} from GPU")
                     del m
 
 model_manager = ModelManager()

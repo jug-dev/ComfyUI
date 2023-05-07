@@ -427,7 +427,7 @@ class VAE:
         return output
 
     def decode(self, samples_in):
-        with model_management.model_manager.sampler_mutex:
+        with model_management.model_manager.vae_mutex:
             tid = threading.current_thread().ident
             #logger.warning(f"VAE.decode({tid}) would unload model")
             # model_management.unload_model()
@@ -461,7 +461,7 @@ class VAE:
             return pixel_samples
 
     def decode_tiled(self, samples, tile_x=64, tile_y=64, overlap = 16):
-        with model_management.model_manager.sampler_mutex:
+        with model_management.model_manager.vae_mutex:
             #logger.warning("VAE.decode_tiled() would unload model")
             # model_management.unload_model()
             self.first_stage_model = self.first_stage_model.to(self.device)
@@ -472,7 +472,7 @@ class VAE:
     def encode(self, pixel_samples):
         #logger.warning("VAE.encode() would unload model")
         # model_management.unload_model()
-        with model_management.model_manager.sampler_mutex:
+        with model_management.model_manager.vae_mutex:
             self.first_stage_model = self.first_stage_model.to(self.device)
             pixel_samples = pixel_samples.movedim(-1,1).to(self.device)
             samples = self.first_stage_model.encode(2. * pixel_samples - 1.).sample() * self.scale_factor
@@ -483,7 +483,7 @@ class VAE:
     def encode_tiled(self, pixel_samples, tile_x=512, tile_y=512, overlap = 64):
         #logger.warning("VAE.decode() would unload model")
         # model_management.unload_model()
-        with model_management.model_manager.sampler_mutex:
+        with model_management.model_manager.vae_mutex:
             self.first_stage_model = self.first_stage_model.to(self.device)
             pixel_samples = pixel_samples.movedim(-1,1).to(self.device)
             samples = utils.tiled_scale(pixel_samples, lambda a: self.first_stage_model.encode(2. * a - 1.).sample() * self.scale_factor, tile_x, tile_y, overlap, upscale_amount = (1/8), out_channels=4)

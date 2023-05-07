@@ -204,8 +204,8 @@ class PromptExecutor:
                 if self.server.client_id is not None:
                     self.server.send_sync("executing", { "node": None }, self.server.client_id)
 
-        gc.collect()
-        comfy.model_management.soft_empty_cache()
+        # gc.collect()
+        # comfy.model_management.soft_empty_cache()
 
 
 def validate_inputs(prompt, item):

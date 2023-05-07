@@ -770,71 +770,73 @@ def common_ksampler(model, seed, steps, cfg, sampler_name, scheduler, positive, 
         noise_mask = noise_mask.to(device)
 
     comfy.model_management.model_manager.set_model_in_use(model)
-    comfy.model_management.model_manager.load_model_gpu(model)
-    real_model = model.model
+    try:
+        comfy.model_management.model_manager.load_model_gpu(model)
+        real_model = model.model
 
-    #logger.warning(f"Moving noise {id(noise):x} to device {device}")
-    noise = noise.to(device)
-    #logger.warning(f"Moving latest image {id(latent_image):x} to device {device}")
-    latent_image = latent_image.to(device)
+        #logger.warning(f"Moving noise {id(noise):x} to device {device}")
+        noise = noise.to(device)
+        #logger.warning(f"Moving latest image {id(latent_image):x} to device {device}")
+        latent_image = latent_image.to(device)
 
-    positive_copy = []
-    negative_copy = []
+        positive_copy = []
+        negative_copy = []
 
-    #logger.warning(f"Assembling control nets")
-    control_nets = []
-    def get_models(cond):
-        models = []
-        for c in cond:
-            if 'control' in c[1]:
-                models += [c[1]['control']]
-            if 'gligen' in c[1]:
-                models += [c[1]['gligen'][1]]
-        return models
+        #logger.warning(f"Assembling control nets")
+        control_nets = []
+        def get_models(cond):
+            models = []
+            for c in cond:
+                if 'control' in c[1]:
+                    models += [c[1]['control']]
+                if 'gligen' in c[1]:
+                    models += [c[1]['gligen'][1]]
+            return models
 
-    for p in positive:
-        t = p[0]
-        if t.shape[0] < noise.shape[0]:
-            t = torch.cat([t] * noise.shape[0])
-        t = t.to(device)
-        positive_copy += [[t] + p[1:]]
-    for n in negative:
-        t = n[0]
-        if t.shape[0] < noise.shape[0]:
-            t = torch.cat([t] * noise.shape[0])
-        t = t.to(device)
-        negative_copy += [[t] + n[1:]]
+        for p in positive:
+            t = p[0]
+            if t.shape[0] < noise.shape[0]:
+                t = torch.cat([t] * noise.shape[0])
+            t = t.to(device)
+            positive_copy += [[t] + p[1:]]
+        for n in negative:
+            t = n[0]
+            if t.shape[0] < noise.shape[0]:
+                t = torch.cat([t] * noise.shape[0])
+            t = t.to(device)
+            negative_copy += [[t] + n[1:]]
 
-    models = get_models(positive) + get_models(negative)
-    if models:
-        comfy.model_management.model_manager.load_controlnet_gpu(models)
-        comfy.model_management.model_manager.sampler_mutex.acquire()
+        models = get_models(positive) + get_models(negative)
+        if models:
+            comfy.model_management.model_manager.load_controlnet_gpu(models)
+            comfy.model_management.model_manager.sampler_mutex.acquire()
 
-    if sampler_name in comfy.samplers.KSampler.SAMPLERS:
-        #logger.warning(f"Creating KSampler for real model {id(real_model):x}")
-        sampler = comfy.samplers.KSampler(real_model, steps=steps, device=device, sampler=sampler_name, scheduler=scheduler, denoise=denoise, model_options=model.model_options)
-    else:
-        #other samplers
-        pass
+        if sampler_name in comfy.samplers.KSampler.SAMPLERS:
+            #logger.warning(f"Creating KSampler for real model {id(real_model):x}")
+            sampler = comfy.samplers.KSampler(real_model, steps=steps, device=device, sampler=sampler_name, scheduler=scheduler, denoise=denoise, model_options=model.model_options)
+        else:
+            #other samplers
+            pass
 
-    #logger.warning(f"Sampling")
-    samples = sampler.sample(noise, positive_copy, negative_copy, cfg=cfg, latent_image=latent_image, start_step=start_step, last_step=last_step, force_full_denoise=force_full_denoise, denoise_mask=noise_mask)
-    #logger.warning("Done sampling")
-    samples = samples.cpu()
+        #logger.warning(f"Sampling")
+        samples = sampler.sample(noise, positive_copy, negative_copy, cfg=cfg, latent_image=latent_image, start_step=start_step, last_step=last_step, force_full_denoise=force_full_denoise, denoise_mask=noise_mask)
+        #logger.warning("Done sampling")
+        samples = samples.cpu()
 
-    #logger.warning("Moved samples to cpu")
-    if models:
-        # XXX force unload models for controlnet
-        #logger.warning("Forcing GPU unload of controlnet models")
-        comfy.model_management.model_manager.unload_controlnet_gpu(models)
-        comfy.model_management.model_manager.unload_model(model)
-        comfy.model_management.model_manager.sampler_mutex.release()
-        for m in models:
-            m.cleanup()
+        #logger.warning("Moved samples to cpu")
+        if models:
+            # XXX force unload models for controlnet
+            #logger.warning("Forcing GPU unload of controlnet models")
+            comfy.model_management.model_manager.unload_controlnet_gpu(models)
+            comfy.model_management.model_manager.unload_model(model)
+            comfy.model_management.model_manager.sampler_mutex.release()
+            for m in models:
+                m.cleanup()
 
-    out = latent.copy()
-    out["samples"] = samples
-    comfy.model_management.model_manager.done_with_model(model)
+        out = latent.copy()
+        out["samples"] = samples
+    finally:
+        comfy.model_management.model_manager.done_with_model(model)
     return (out, )
 
 class KSampler:
