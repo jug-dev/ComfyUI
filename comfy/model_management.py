@@ -358,6 +358,8 @@ def get_free_memory(dev=None, torch_free_too=False):
         return mem_free_total
 
 def maximum_batch_area():
+    return 0
+    # See https://github.com/jug-dev/hordelib/issues/225
     global vram_state
     if vram_state == VRAMState.NO_VRAM:
         return 0
