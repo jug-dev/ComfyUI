@@ -19,6 +19,7 @@ set_vram_to = VRAMState.NORMAL_VRAM
 
 total_vram = 0
 total_vram_available_mb = -1
+enable_batch_optimisations = True
 
 accelerate_enabled = False
 xpu_available = False
@@ -33,13 +34,6 @@ try:
     except:
         total_vram = torch.cuda.mem_get_info(torch.cuda.current_device())[1] / (1024 * 1024)
     total_ram = psutil.virtual_memory().total / (1024 * 1024)
-    if not args.normalvram and not args.cpu:
-        if total_vram <= 4096:
-            print("Trying to enable lowvram mode because your GPU seems to have 4GB or less. If you don't want this use: --normalvram")
-            set_vram_to = VRAMState.LOW_VRAM
-        elif total_vram > total_ram * 1.1 and total_vram > 14336:
-            print("Enabling highvram mode because your GPU has more vram than your computer has ram. If you don't want this use: --normalvram")
-            vram_state = VRAMState.HIGH_VRAM
 except:
     pass
 
@@ -186,6 +180,11 @@ class ModelManager:
             if model in self.models_in_use:
                 self.models_in_use.remove(model)
 
+    def have_free_vram(self):
+        freemem = round(get_free_memory(get_torch_device()) / (1024 * 1024))
+        logger.debug(f"Free VRAM is: {freemem}MB ({len(self.current_loaded_models)} models loaded on GPU)")
+        return freemem > self.user_reserved_vram_mb
+
     def load_model_gpu(self, model):
         global vram_state
         
@@ -194,9 +193,7 @@ class ModelManager:
 
             # Don't run out of vram
             if self.current_loaded_models:
-                freemem = round(get_free_memory(get_torch_device()) / (1024 * 1024))
-                logger.debug(f"Free VRAM is: {freemem}MB ({len(self.current_loaded_models)} models loaded on GPU)")
-                if freemem < self.user_reserved_vram_mb:
+                if not self.have_free_vram():
                     # Release the first least used model that we can
                     for release_model in reversed(self.current_loaded_models):
                         if self.unload_model(release_model):
@@ -283,6 +280,12 @@ class ModelManager:
                     self.current_gpu_controlnets.remove(m)
                     del m
 
+    def set_batch_optimisations(self, enable):
+        with self._property_mutex:
+            global enable_batch_optimisations
+            enable_batch_optimisations = enable
+
+
 model_manager = ModelManager()
 
 
@@ -358,6 +361,8 @@ def get_free_memory(dev=None, torch_free_too=False):
         return mem_free_total
 
 def maximum_batch_area():
+    if not enable_batch_optimisations:
+        return 0
     global vram_state
     if vram_state == VRAMState.NO_VRAM:
         return 0
