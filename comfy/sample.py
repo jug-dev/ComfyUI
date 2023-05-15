@@ -57,7 +57,7 @@ def load_additional_models(positive, negative):
     gligen = get_models_from_cond(positive, "gligen") + get_models_from_cond(negative, "gligen")
     gligen = [x[1] for x in gligen]
     models = control_nets + gligen
-    comfy.model_management.load_controlnet_gpu(models)
+    #comfy.model_management.load_controlnet_gpu(models)
     return models
 
 def cleanup_additional_models(models):

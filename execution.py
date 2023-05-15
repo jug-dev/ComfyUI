@@ -211,7 +211,6 @@ class PromptExecutor:
 
     def execute(self, prompt, prompt_id, extra_data={}, execute_outputs=[]):
         nodes.interrupt_processing(False)
-
         if "client_id" in extra_data:
             self.server.client_id = extra_data["client_id"]
         else:
@@ -270,15 +269,16 @@ class PromptExecutor:
                     d = self.outputs.pop(o)
                     del d
             finally:
-                for x in executed:
-                    self.old_prompt[x] = copy.deepcopy(prompt[x])
+                # Don't do this, pointless waste of resources in horde
+                # for x in executed:
+                #     self.old_prompt[x] = copy.deepcopy(prompt[x])
                 self.server.last_node_id = None
                 if self.server.client_id is not None:
                     self.server.send_sync("executing", { "node": None, "prompt_id": prompt_id }, self.server.client_id)
 
         # print("Prompt executed in {:.2f} seconds".format(time.perf_counter() - execution_start_time))
-        # gc.collect()
-        # comfy.model_management.soft_empty_cache()
+        gc.collect()
+        comfy.model_management.soft_empty_cache()
 
 
 def validate_inputs(prompt, item, validated):
@@ -351,6 +351,7 @@ def validate_prompt(prompt):
             outputs.add(x)
 
     if len(outputs) == 0:
+        logger.error("Prompt has no outputs")
         return (False, "Prompt has no outputs")
 
     good_outputs = set()
@@ -379,8 +380,8 @@ def validate_prompt(prompt):
         errors_list = "\n".join(set(map(lambda a: "{}".format(a[1]), errors)))
         return (False, "Prompt has no properly connected outputs\n {}".format(errors_list))
 
-    with open("../comfy-prompt.json", "wt", encoding="utf-8") as f:
-        f.write(json.dumps(prompt, indent=4))
+    # with open("../comfy-prompt.json", "wt", encoding="utf-8") as f:
+    #     f.write(json.dumps(prompt, indent=4))
     return (True, "", list(good_outputs))
 
 
