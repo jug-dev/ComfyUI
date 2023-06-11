@@ -81,20 +81,22 @@ def sample(model, noise, steps, cfg, sampler_name, scheduler, positive, negative
     positive_copy = broadcast_cond(positive, noise.shape[0], device)
     negative_copy = broadcast_cond(negative, noise.shape[0], device)
 
-    models = load_additional_models(positive, negative)
-    if models:
-        comfy.model_management.model_manager.load_controlnet_gpu(models)
+    try:
+        models = load_additional_models(positive, negative)
+        if models:
+            comfy.model_management.model_manager.load_controlnet_gpu(models)
         comfy.model_management.model_manager.sampler_mutex.acquire()
 
-    sampler = comfy.samplers.KSampler(real_model, steps=steps, device=device, sampler=sampler_name, scheduler=scheduler, denoise=denoise, model_options=model.model_options)
+        sampler = comfy.samplers.KSampler(real_model, steps=steps, device=device, sampler=sampler_name, scheduler=scheduler, denoise=denoise, model_options=model.model_options)
 
-    samples = sampler.sample(noise, positive_copy, negative_copy, cfg=cfg, latent_image=latent_image, start_step=start_step, last_step=last_step, force_full_denoise=force_full_denoise, denoise_mask=noise_mask, sigmas=sigmas, callback=callback, disable_pbar=disable_pbar)
-    samples = samples.cpu()
+        samples = sampler.sample(noise, positive_copy, negative_copy, cfg=cfg, latent_image=latent_image, start_step=start_step, last_step=last_step, force_full_denoise=force_full_denoise, denoise_mask=noise_mask, sigmas=sigmas, callback=callback, disable_pbar=disable_pbar)
+        samples = samples.cpu()
 
-    if models:
-        comfy.model_management.model_manager.unload_controlnet_gpu(models)
-        comfy.model_management.model_manager.unload_model(model)
+        if models:
+            comfy.model_management.model_manager.unload_controlnet_gpu(models)
+    finally:
         comfy.model_management.model_manager.sampler_mutex.release()
+        model.unpatch_model()
+        cleanup_additional_models(models)
 
-    cleanup_additional_models(models)
     return samples

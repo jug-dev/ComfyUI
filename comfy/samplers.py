@@ -248,10 +248,8 @@ def sampling_function(model_function, x, timestep, uncond, cond, cond_scale, con
 
                 c['transformer_options'] = transformer_options
 
-                model_management.model_manager.sampler_mutex.acquire()
                 output = model_function(input_x, timestep_, cond=c).chunk(batch_chunks)
                 del input_x
-                model_management.model_manager.sampler_mutex.release()
 
                 # model_management.throw_exception_if_processing_interrupted()
                 

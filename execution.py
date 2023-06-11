@@ -343,7 +343,7 @@ def validate_inputs(prompt, item, validated):
     validated[unique_id] = ret
     return ret
 
-def validate_prompt(prompt):
+def validate_prompt(prompt, horde=False):
     outputs = set()
     for x in prompt:
         class_ = nodes.NODE_CLASS_MAPPINGS[prompt[x]['class_type']]
@@ -380,8 +380,9 @@ def validate_prompt(prompt):
         errors_list = "\n".join(set(map(lambda a: "{}".format(a[1]), errors)))
         return (False, "Prompt has no properly connected outputs\n {}".format(errors_list))
 
-    # with open("../comfy-prompt.json", "wt", encoding="utf-8") as f:
-    #     f.write(json.dumps(prompt, indent=4))
+    if not horde:
+        with open("../comfy-prompt.json", "wt", encoding="utf-8") as f:
+            f.write(json.dumps(prompt, indent=4))
     return (True, "", list(good_outputs))
 
 

@@ -345,7 +345,6 @@ class ModelPatcher:
     def patch_model(self):
         model_sd = self.model.state_dict()
         for p in self.patches:
-            #logger.warning(f"Patching model {id(self):x} {len(self.patches)} patches")
             for k in p[1]:
                 v = p[1][k]
                 key = k
@@ -710,6 +709,7 @@ class ControlNet:
         out.append(self.control_model)
         return out
 
+# Cache the controlnet diff models, about 4GB RAM
 _controlnet_models = {}
 
 def load_controlnet(ckpt_path, model=None):
@@ -778,7 +778,6 @@ def load_controlnet(ckpt_path, model=None):
             if model is not None:
                 m = model.patch_model()
                 model_sd = m.state_dict()
-                #logger.warning(f"Modifying model {id(model):x} with controlnet {id(controlnet_data):x}")
                 for x in controlnet_data:
                     c_m = "control_model."
                     if x.startswith(c_m):

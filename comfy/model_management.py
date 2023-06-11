@@ -231,7 +231,6 @@ class ModelManager:
         global vram_state
         
         with self._load_mutex:
-            #logger.warning(f"load_model_gpu( {id(model):x} )")
 
             # Don't run out of vram
             if self.current_loaded_models:
@@ -246,18 +245,15 @@ class ModelManager:
             if model in self.current_loaded_models:
                 # Move this model to the top of the list
                 self.current_loaded_models.insert(0, self.current_loaded_models.pop(self.current_loaded_models.index(model)))
-                #logger.warning(f"Model {id(model):x} already on GPU so not loading")
                 return model
             
             try:
-                #logger.warning(f"Patching model {id(model):x}")
                 real_model = model.patch_model()
             except Exception as e:
                 logger.error("Patching failed")
                 model.unpatch_model()
                 raise e
             
-            #logger.warning(f"Adding model to current_loaded_models {id(model):x}")
             self.current_loaded_models.insert(0, model)
             model.model_patches_to(get_torch_device())
 
@@ -268,11 +264,8 @@ class ModelManager:
                 real_model.to(mps_device)
             elif vram_state == VRAMState.NORMAL_VRAM or vram_state == VRAMState.HIGH_VRAM:
                 if model in self.models_accelerated:
-                    #logger.warning(f"removing model from accelerated list {id(model):x}")
                     self.models_accelerated.remove(model)
-                #logger.warning(f"Moving model {id(model):x} / {id(real_model):x} to device {get_torch_device()}")
                 real_model.to(get_torch_device())
-                #logger.warning(f"Done moving model {id(model):x} / {id(real_model):x} to device {get_torch_device()}")
             else:
                 if vram_state == VRAMState.NO_VRAM:
                     device_map = accelerate.infer_auto_device_map(real_model, max_memory={0: "256MiB", "cpu": "16GiB"})
@@ -300,7 +293,6 @@ class ModelManager:
             device = get_torch_device()
             for m in models:
                 if m not in self.current_gpu_controlnets:
-                    #logger.warning(f"Loaded controlnet {id(m):x} to GPU")
                     self.current_gpu_controlnets.append(m.to(device))
 
     def unload_controlnet_gpu(self, control_models):
