@@ -7294,10 +7294,6 @@ LGraphNode.prototype.executeAction = function(action)
         if (this.onShowNodePanel) {
             this.onShowNodePanel(n);
         }
-		else
-		{
-			this.showShowNodePanel(n);
-		}
 
         if (this.onNodeDblClicked) {
             this.onNodeDblClicked(n);
@@ -8099,11 +8095,15 @@ LGraphNode.prototype.executeAction = function(action)
 		bgcolor = bgcolor || LiteGraph.NODE_DEFAULT_COLOR;
 		hovercolor = hovercolor || "#555";
 		textcolor = textcolor || LiteGraph.NODE_TEXT_COLOR;
-		var yFix = y + LiteGraph.NODE_TITLE_HEIGHT + 2;	// fix the height with the title
-		var pos = this.mouse;
-		var hover = LiteGraph.isInsideRectangle( pos[0], pos[1], x,yFix,w,h );
-		pos = this.last_click_position;
-		var clicked = pos && LiteGraph.isInsideRectangle( pos[0], pos[1], x,yFix,w,h );
+		var pos = this.ds.convertOffsetToCanvas(this.graph_mouse);
+		var hover = LiteGraph.isInsideRectangle( pos[0], pos[1], x,y,w,h );
+		pos = this.last_click_position ? [this.last_click_position[0], this.last_click_position[1]] : null;
+        if(pos) {
+            var rect = this.canvas.getBoundingClientRect();
+            pos[0] -= rect.left;
+            pos[1] -= rect.top;
+        }
+		var clicked = pos && LiteGraph.isInsideRectangle( pos[0], pos[1], x,y,w,h );
 
 		ctx.fillStyle = hover ? hovercolor : bgcolor;
 		if(clicked)
@@ -9734,7 +9734,7 @@ LGraphNode.prototype.executeAction = function(action)
                     if (show_text) {
                         ctx.textAlign = "center";
                         ctx.fillStyle = text_color;
-                        ctx.fillText(w.name, widget_width * 0.5, y + H * 0.7);
+                        ctx.fillText(w.label || w.name, widget_width * 0.5, y + H * 0.7);
                     }
                     break;
                 case "toggle":
@@ -9755,8 +9755,9 @@ LGraphNode.prototype.executeAction = function(action)
                     ctx.fill();
                     if (show_text) {
                         ctx.fillStyle = secondary_text_color;
-                        if (w.name != null) {
-                            ctx.fillText(w.name, margin * 2, y + H * 0.7);
+                        const label = w.label || w.name;    
+                        if (label != null) {
+                            ctx.fillText(label, margin * 2, y + H * 0.7);
                         }
                         ctx.fillStyle = w.value ? text_color : secondary_text_color;
                         ctx.textAlign = "right";
@@ -9791,7 +9792,7 @@ LGraphNode.prototype.executeAction = function(action)
                         ctx.textAlign = "center";
                         ctx.fillStyle = text_color;
                         ctx.fillText(
-                            w.name + "  " + Number(w.value).toFixed(3),
+                            w.label || w.name + "  " + Number(w.value).toFixed(3),
                             widget_width * 0.5,
                             y + H * 0.7
                         );
@@ -9826,7 +9827,7 @@ LGraphNode.prototype.executeAction = function(action)
 							ctx.fill();
 						}
                         ctx.fillStyle = secondary_text_color;
-                        ctx.fillText(w.name, margin * 2 + 5, y + H * 0.7);
+                        ctx.fillText(w.label || w.name, margin * 2 + 5, y + H * 0.7);
                         ctx.fillStyle = text_color;
                         ctx.textAlign = "right";
                         if (w.type == "number") {
@@ -9878,8 +9879,9 @@ LGraphNode.prototype.executeAction = function(action)
 
 	                    //ctx.stroke();
                         ctx.fillStyle = secondary_text_color;
-                        if (w.name != null) {
-                            ctx.fillText(w.name, margin * 2, y + H * 0.7);
+                        const label = w.label || w.name;	
+                        if (label != null) {
+                            ctx.fillText(label, margin * 2, y + H * 0.7);
                         }
                         ctx.fillStyle = text_color;
                         ctx.textAlign = "right";
@@ -13064,6 +13066,10 @@ LGraphNode.prototype.executeAction = function(action)
                     content: "Properties",
                     has_submenu: true,
                     callback: LGraphCanvas.onShowMenuNodeProperties
+                },
+                {
+                    content: "Properties Panel",
+                    callback: function(item, options, e, menu, node) { LGraphCanvas.active_canvas.showShowNodePanel(node) }
                 },
                 null,
                 {

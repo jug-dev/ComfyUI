@@ -248,7 +248,7 @@ def sampling_function(model_function, x, timestep, uncond, cond, cond_scale, con
 
                 c['transformer_options'] = transformer_options
 
-                output = model_function(input_x, timestep_, cond=c).chunk(batch_chunks)
+                output = model_function(input_x, timestep_, **c).chunk(batch_chunks)
                 del input_x
 
                 # model_management.throw_exception_if_processing_interrupted()
@@ -273,7 +273,8 @@ def sampling_function(model_function, x, timestep, uncond, cond, cond_scale, con
         max_total_area = model_management.maximum_batch_area()
         cond, uncond = calc_cond_uncond_batch(model_function, cond, uncond, x, timestep, max_total_area, cond_concat, model_options)
         if "sampler_cfg_function" in model_options:
-            return model_options["sampler_cfg_function"](cond, uncond, cond_scale)
+            args = {"cond": cond, "uncond": uncond, "cond_scale": cond_scale, "timestep": timestep}
+            return model_options["sampler_cfg_function"](args)
         else:
             return uncond + (cond - uncond) * cond_scale
 
@@ -460,45 +461,27 @@ def apply_empty_x_to_equal_area(conds, uncond, name, uncond_fill_func):
             uncond[temp[1]] = [o[0], n]
 
 
-def encode_adm(noise_augmentor, conds, batch_size, device):
+def encode_adm(model, conds, batch_size, device):
     for t in range(len(conds)):
         x = conds[t]
+        adm_out = None
         if 'adm' in x[1]:
-            adm_inputs = []
-            weights = []
-            noise_aug = []
-            adm_in = x[1]["adm"]
-            for adm_c in adm_in:
-                adm_cond = adm_c[0].image_embeds
-                weight = adm_c[1]
-                noise_augment = adm_c[2]
-                noise_level = round((noise_augmentor.max_noise_level - 1) * noise_augment)
-                c_adm, noise_level_emb = noise_augmentor(adm_cond.to(device), noise_level=torch.tensor([noise_level], device=device))
-                adm_out = torch.cat((c_adm, noise_level_emb), 1) * weight
-                weights.append(weight)
-                noise_aug.append(noise_augment)
-                adm_inputs.append(adm_out)
-
-            if len(noise_aug) > 1:
-                adm_out = torch.stack(adm_inputs).sum(0)
-                #TODO: add a way to control this
-                noise_augment = 0.05
-                noise_level = round((noise_augmentor.max_noise_level - 1) * noise_augment)
-                c_adm, noise_level_emb = noise_augmentor(adm_out[:, :noise_augmentor.time_embed.dim], noise_level=torch.tensor([noise_level], device=device))
-                adm_out = torch.cat((c_adm, noise_level_emb), 1)
+            adm_out = x[1]["adm"]
         else:
-            adm_out = torch.zeros((1, noise_augmentor.time_embed.dim * 2), device=device)
-        x[1] = x[1].copy()
-        x[1]["adm_encoded"] = torch.cat([adm_out] * batch_size)
+            params = x[1].copy()
+            adm_out = model.encode_adm(device=device, **params)
+        if adm_out is not None:
+            x[1] = x[1].copy()
+            x[1]["adm_encoded"] = torch.cat([adm_out] * batch_size).to(device)
 
     return conds
 
 
 class KSampler:
-    SCHEDULERS = ["karras", "normal", "simple", "ddim_uniform"]
+    SCHEDULERS = ["normal", "karras", "exponential", "simple", "ddim_uniform"]
     SAMPLERS = ["euler", "euler_ancestral", "heun", "dpm_2", "dpm_2_ancestral",
                 "lms", "dpm_fast", "dpm_adaptive", "dpmpp_2s_ancestral", "dpmpp_sde",
-                "dpmpp_2m", "ddim", "uni_pc", "uni_pc_bh2"]
+                "dpmpp_2m", "dpmpp_2m_sde", "ddim", "uni_pc", "uni_pc_bh2"]
 
     def __init__(self, model, steps, device, sampler=None, scheduler=None, denoise=None, model_options={}):
         self.model = model
@@ -532,6 +515,8 @@ class KSampler:
 
         if self.scheduler == "karras":
             sigmas = k_diffusion_sampling.get_sigmas_karras(n=steps, sigma_min=self.sigma_min, sigma_max=self.sigma_max)
+        elif self.scheduler == "exponential":
+            sigmas = k_diffusion_sampling.get_sigmas_exponential(n=steps, sigma_min=self.sigma_min, sigma_max=self.sigma_max)
         elif self.scheduler == "normal":
             sigmas = self.model_wrap.get_sigmas(steps)
         elif self.scheduler == "simple":
@@ -589,14 +574,14 @@ class KSampler:
         apply_empty_x_to_equal_area(positive, negative, 'control', lambda cond_cnets, x: cond_cnets[x])
         apply_empty_x_to_equal_area(positive, negative, 'gligen', lambda cond_cnets, x: cond_cnets[x])
 
-        if self.model.model.diffusion_model.dtype == torch.float16:
+        if self.model.get_dtype() == torch.float16:
             precision_scope = torch.autocast
         else:
             precision_scope = contextlib.nullcontext
 
-        if hasattr(self.model, 'noise_augmentor'): #unclip
-            positive = encode_adm(self.model.noise_augmentor, positive, noise.shape[0], self.device)
-            negative = encode_adm(self.model.noise_augmentor, negative, noise.shape[0], self.device)
+        if self.model.is_adm():
+            positive = encode_adm(self.model, positive, noise.shape[0], self.device)
+            negative = encode_adm(self.model, negative, noise.shape[0], self.device)
 
         extra_args = {"cond":positive, "uncond":negative, "cond_scale": cfg, "model_options": self.model_options}
 
@@ -665,7 +650,10 @@ class KSampler:
                 self.model_k.latent_image = latent_image
                 self.model_k.noise = noise
 
-                noise = noise * sigmas[0]
+                if max_denoise:
+                    noise = noise * torch.sqrt(1.0 + sigmas[0] ** 2.0)
+                else:
+                    noise = noise * sigmas[0]
 
                 k_callback = None
                 total_steps = len(sigmas) - 1
